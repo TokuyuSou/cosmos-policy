@@ -1,2 +1,7 @@
 /.cuda-name
 /build
+__pycache__
+logs/
+research/data/
+research/results/
+/robocasa-cosmos-policy/

@@ -2,7 +2,7 @@
 # Cosmos Policy 用 Docker ヘルパー
 #   - イメージのビルド
 #   - 永続コンテナ(exit しても消えない)の起動 / 入室 / 停止 / 削除
-#   - /data3/cao を /workspace にマウント
+#   - /data1/cao を /workspace にマウント
 #
 # 使い方:
 #   ./docker_run.sh build      # イメージをビルド
@@ -18,14 +18,14 @@ set -euo pipefail
 # --- 設定 ---------------------------------------------------------------
 IMAGE_NAME="cosmos-policy"
 CONTAINER_NAME="cosmos-policy"
-REPO_DIR="/data3/cao/cosmos-policy"   # Dockerfile があるリポジトリ
-MOUNT_SRC="/data3/cao"                # ホスト側: /workspace にマウントする
+REPO_DIR="/data1/cao/cosmos-policy"   # Dockerfile があるリポジトリ
+MOUNT_SRC="/data1/cao"                # ホスト側: /workspace にマウントする
 MOUNT_DST="/workspace"
 WORKDIR="/workspace/cosmos-policy"    # 入室時の作業ディレクトリ(リポジトリ直下)
-# 全キャッシュ(uv / huggingface / pip / torch 等)を /data3 上に置く。
+# 全キャッシュ(uv / huggingface / pip / torch 等)を /data1 上に置く。
 # ホスト側 CACHE_DIR を コンテナ内 ~/.cache にマウントするので、~/.cache を
-# 既定先とするツールは自動的に /data3 を使う。さらに念のため環境変数でも明示する。
-CACHE_DIR="/data3/cao/.cache"        # ホスト側キャッシュ置き場 (/data3)
+# 既定先とするツールは自動的に /data1 を使う。さらに念のため環境変数でも明示する。
+CACHE_DIR="/data1/cao/.cache"        # ホスト側キャッシュ置き場 (/data1)
 USER_NAME="$(id -un)"
 CONTAINER_HOME="/home/${USER_NAME}"  # entrypoint がマッピングするコンテナ内ホーム
 CONTAINER_CACHE="${CONTAINER_HOME}/.cache"
@@ -83,7 +83,7 @@ up() {
   # CMD を sleep infinity にして常駐させ、作業は exec で入る。
   # --rm を付けないので exit / stop しても消えない。
   # キャッシュ環境変数は docker run 時に設定する。こうすると enter(exec) でも
-  # VSCode の Attach でも継承され、uv / hf / pip / torch が全て /data3 を使う。
+  # VSCode の Attach でも継承され、uv / hf / pip / torch が全て /data1 を使う。
   docker run -d \
     --name "${CONTAINER_NAME}" \
     --security-opt no-new-privileges \

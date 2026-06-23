@@ -29,9 +29,14 @@ uv run --extra cu128                  --python 3.10  python <script> ...
 ## Run a task end-to-end
 
 Substitute `TASK` (env name, e.g. `PnPCounterToStove`) and `DBASE` (snake_case, e.g.
-`pnp_counter_to_stove`). Run from the repo root. A ready-made driver for all of the below is
-`research/results/closed_loop/_batch/run_task_pipeline.sh <TASK> <DBASE>` (not under version control,
-since it lives in the git-ignored `results/` tree — the canonical commands are reproduced here).
+`pnp_counter_to_stove`). Run from the repo root. Ready-made drivers reproduce every step below:
+
+- **one task**: `bash research/scripts/run_task_pipeline.sh TASK DBASE`
+- **all remaining tasks, sequentially** (SSH-resilient): `setsid nohup bash research/scripts/run_all_remaining.sh &`
+  — edit the `TASKS` list inside to choose which tasks to run.
+
+Both write their outputs/logs under the git-ignored `research/results/closed_loop/<TASK>/` tree. The
+individual commands they run are reproduced below for reference.
 
 **1. Collect 150 demos** (dense, with VLA shadow queries at stride 4):
 ```bash

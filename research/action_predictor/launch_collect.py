@@ -40,12 +40,18 @@ def main():
                     choices=["collect_data.py", "collect_data_dense.py"])
     ap.add_argument("--task", default="PnPCounterToStove")
     ap.add_argument("--total-episodes", type=int, default=150)
+    ap.add_argument("--episode-offset", type=int, default=0,
+                    help="first episode index (default 0). Use to APPEND new episodes to an existing "
+                         "dataset without overwriting: --episode-offset 150 collects [150, 150+total). "
+                         "Episode index seeds the scene, so new indices = new (non-duplicate) scenes.")
     ap.add_argument("--gpus", default="0,1,2")
     ap.add_argument("--procs-per-gpu", type=int, default=5)
     ap.add_argument("--query-stride", type=int, default=4)
     ap.add_argument("--out-dir", default="research/data/pnp_counter_to_stove_dense")
     ap.add_argument("--seed", type=int, default=195)
     ap.add_argument("--denoising-steps", type=int, default=5)
+    ap.add_argument("--no-vla-shadow", action="store_true",
+                    help="dense only: skip shadow VLA calls; store zeroed chunk/future_* (proprio+images only)")
     ap.add_argument("--stagger-sec", type=float, default=12.0,
                     help="delay between launches so model-load spikes don't collide")
     args = ap.parse_args()
@@ -70,15 +76,18 @@ def main():
         # required pairing, binding_utils.py asserts it is a substring of CUDA_VISIBLE_DEVICES).
         # With even per-GPU distribution this spreads rendering across all GPUs.
         env["MUJOCO_EGL_DEVICE_ID"] = gpu
+        abs_start = args.episode_offset + start  # absolute episode index (append-safe)
         cmd = [sys.executable, collector, "--task", args.task,
-               "--episode-start", str(start), "--num-episodes", str(cnt),
+               "--episode-start", str(abs_start), "--num-episodes", str(cnt),
                "--out-dir", args.out_dir, "--seed", str(args.seed),
                "--denoising-steps", str(args.denoising_steps)]
         if is_dense:
             cmd += ["--query-stride", str(args.query_stride)]
-        log_path = os.path.join(args.out_dir, f"log_gpu{gpu}_ep{start:04d}-{start + cnt - 1:04d}.log")
+            if args.no_vla_shadow:
+                cmd += ["--no-vla-shadow"]
+        log_path = os.path.join(args.out_dir, f"log_gpu{gpu}_ep{abs_start:04d}-{abs_start + cnt - 1:04d}.log")
         log = open(log_path, "w")
-        print(f"  proc{k:02d}: GPU{gpu} episodes [{start},{start + cnt}) -> {log_path}", flush=True)
+        print(f"  proc{k:02d}: GPU{gpu} episodes [{abs_start},{abs_start + cnt}) -> {log_path}", flush=True)
         procs.append(subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT))
         time.sleep(args.stagger_sec)
 

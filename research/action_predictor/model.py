@@ -15,10 +15,56 @@ residual from a repeat-last anchor (mean + log_std per action dim).
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
+from torchvision import models
 
 from common import ACTION_DIM, LATENT_C, LATENT_H, LATENT_W, PROPRIO_DIM
+
+_R3M_RESNET18 = "/workspace/openpi/checkpoints/r3m/r3m_resnet18.pt"
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+class SpatialVisionEncoder(nn.Module):
+    """Shared R3M ResNet-18 -> a small spatial token GRID per view (end-to-end trainable top block).
+
+    Both views (primary, wrist) pass through the SAME backbone; their tokens occupy distinct slots in
+    the predictor's sequence, so the predictor's learned positional embedding gives each token its
+    (camera, grid-cell) identity -- the multi-camera ACT recipe. By default only ``layer4`` + the 1x1
+    projection train; the R3M-pretrained lower blocks stay frozen (cheap, stable). Forward takes raw
+    uint8 (B,3,224,224) frames and applies the R3M preprocessing (/255 + ImageNet-normalize) inside.
+    """
+
+    def __init__(self, width, grid=4, init="r3m", freeze="layer4"):
+        super().__init__()
+        net = models.resnet18(weights=None)
+        sd = torch.load(_R3M_RESNET18 if init in ("r3m", "", None) else init, map_location="cpu")
+        sd = {k[len("primary_bb.net."):]: v for k, v in sd.items() if k.startswith("primary_bb.net.")} or sd
+        net.load_state_dict(sd, strict=False)  # fc is absent in the R3M checkpoint
+        self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool,
+                                  net.layer1, net.layer2, net.layer3, net.layer4)
+        for p in self.stem.parameters():
+            p.requires_grad = (freeze == "all")
+        if freeze == "layer4":
+            for p in self.stem[7].parameters():   # stem[7] = layer4
+                p.requires_grad = True
+        self.pool = nn.AdaptiveAvgPool2d(grid)
+        self.proj = nn.Conv2d(512, width, 1)
+        self.norm = nn.LayerNorm(width)
+        self.grid, self.n_tokens = grid, 2 * grid * grid
+        self.register_buffer("mean", torch.tensor(_IMAGENET_MEAN).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1))
+
+    def _tokens(self, x):                          # (B,3,224,224) uint8/[0,255] -> (B, grid*grid, width)
+        x = (x.float() / 255.0 - self.mean) / self.std
+        f = self.pool(self.proj(self.stem(x)))     # (B,width,g,g)
+        return self.norm(f.flatten(2).transpose(1, 2))
+
+    def forward(self, primary, wrist):             # -> (B, 2*grid*grid, width)
+        return torch.cat([self._tokens(primary), self._tokens(wrist)], dim=1)
 
 
 def mlp_proj(in_dim: int, width: int) -> nn.Module:
@@ -103,6 +149,12 @@ class ActionPredictor(nn.Module):
         ffn_mult: int = 4,
         dropout: float = 0.1,
         grid: int = 4,
+        use_obs_emb: bool = False,
+        obs_dim: int = 128,
+        vis_mode: str = "none",
+        vis_grid: int = 4,
+        vis_init: str = "r3m",
+        vis_freeze: str = "layer4",
     ):
         super().__init__()
         self.pred_h = pred_h
@@ -112,9 +164,16 @@ class ActionPredictor(nn.Module):
         self.act_proj = mlp_proj(ACTION_DIM, width)  # shared over prev-action tokens
         self.state_proj = mlp_proj(PROPRIO_DIM, width)
         self.img_enc = ImageEncoder(img_mode, n_views, width, grid=grid)
+        # Optional precomputed observation-embedding token (e.g. the R3M action-metric encoder):
+        # one global vector per frame -> one token, fused by attention like any other modality.
+        self.obs_proj = mlp_proj(obs_dim, width) if use_obs_emb else None
+        # Optional end-to-end SPATIAL vision: a grid of R3M tokens per view that the query tokens
+        # attend to (ACT-style). Takes raw frames; runs the backbone inside forward.
+        self.vis = SpatialVisionEncoder(width, vis_grid, vis_init, vis_freeze) if vis_mode == "spatial" else None
         self.query = nn.Parameter(torch.randn(pred_h, width) * 0.02)
 
-        n_tokens = prev_h + 1 + self.img_enc.n_tokens + pred_h
+        n_vis = self.vis.n_tokens if self.vis is not None else 0
+        n_tokens = prev_h + 1 + self.img_enc.n_tokens + (1 if use_obs_emb else 0) + n_vis + pred_h
         self.pos = nn.Parameter(torch.randn(n_tokens, width) * 0.02)
 
         layer = nn.TransformerEncoderLayer(
@@ -125,13 +184,19 @@ class ActionPredictor(nn.Module):
         self.head_mean = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, ACTION_DIM))
         self.head_logstd = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, ACTION_DIM))
 
-    def forward(self, prev_actions, state, future_img):
+    def forward(self, prev_actions, state, future_img, obs_emb=None, image=None, wrist=None):
         B = prev_actions.shape[0]
         prev_tok = self.act_proj(prev_actions)  # (B,prev_h,width)
         state_tok = self.state_proj(state).unsqueeze(1)  # (B,1,width)
         tokens = [prev_tok, state_tok]
         if self.img_enc.n_tokens > 0:
             tokens.append(self.img_enc(future_img))
+        if self.obs_proj is not None:
+            assert obs_emb is not None, "model built with use_obs_emb=True but obs_emb not provided"
+            tokens.append(self.obs_proj(obs_emb).unsqueeze(1))  # (B,1,width) observation-embedding token
+        if self.vis is not None:
+            assert image is not None and wrist is not None, "vis_mode='spatial' needs image & wrist frames"
+            tokens.append(self.vis(image, wrist))  # (B, 2*g*g, width) spatial vision tokens
         tokens.append(self.query.unsqueeze(0).expand(B, -1, -1))  # (B,pred_h,width)
         x = torch.cat(tokens, dim=1) + self.pos.unsqueeze(0)
         x = self.encoder(x)

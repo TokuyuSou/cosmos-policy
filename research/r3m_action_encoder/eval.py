@@ -60,6 +60,62 @@ def embed_all_mm(model, data, device, bs=512):
     return np.concatenate(out).astype(np.float32)
 
 
+def episode_initial_idx(data):
+    """Map each decision point to the global row index of its episode's INITIAL frame (min normalized
+    progress). Used by the InitDiffFusedEncoder so each point can be paired with its episode's t~0 scene.
+    Episode ids are globally unique (multi-task offsets them), so this is correct per task too."""
+    out = np.empty(len(data.ep), dtype=np.int64)
+    for e in np.unique(data.ep):
+        idx = np.where(data.ep == e)[0]
+        out[idx] = int(idx[int(np.argmin(data.prog[idx]))])
+    return out
+
+
+@torch.no_grad()
+def embed_all_mm_initdiff(model, data, device, init_idx, bs=512):
+    """``embed_all_mm`` for the InitDiffFusedEncoder: additionally passes each point's episode-INITIAL
+    primary+wrist frames (gathered via ``init_idx``) so the current-minus-initial diff streams are built.
+    Single global input-norm (single-task or mixed multi-task), matching ``embed_all_mm``."""
+    model.eval()
+    out = []
+    for i in range(0, len(data.act), bs):
+        sl = slice(i, i + bs)
+        p = _to_chw(data.primary[sl]).to(device)
+        w = _to_chw(data.wrist[sl]).to(device)
+        prev = torch.as_tensor(data.prev[sl], device=device)
+        pro = torch.as_tensor(data.proprio[sl], device=device)
+        ii = init_idx[i:i + bs]
+        pi = _to_chw(data.primary[ii]).to(device)
+        wi = _to_chw(data.wrist[ii]).to(device)
+        out.append(model(p, w, prev, pro, primary_init=pi, wrist_init=wi).cpu().numpy())
+    return np.concatenate(out).astype(np.float32)
+
+
+@torch.no_grad()
+def embed_all_mm_pertask(model, data, device, bs=512):
+    """Multi-task fused embedding with PER-TASK input standardization: each task's points are embedded
+    with the model's norm buffers set to THAT task's stats (task_am/asd for prev, task_pm/psd for
+    proprio), then assembled into (N, out_dim). This is the eval-time counterpart of the per-task
+    set_norm done during multi-task training, so the encoder always sees inputs standardized in their
+    own task's frame. Leaves the model's norm buffers at the last task's stats (callers re-set as needed).
+    Single-task data reduces this to ``embed_all_mm`` (one task)."""
+    model.eval()
+    out = np.zeros((len(data.act), model.out_dim), dtype=np.float32)
+    for t in range(len(data.tasks)):
+        idx = np.where(data.task == t)[0]
+        if len(idx) == 0:
+            continue
+        model.set_norm(data.task_am[t], data.task_asd[t], data.task_pm[t], data.task_psd[t])
+        for i in range(0, len(idx), bs):
+            j = idx[i:i + bs]
+            p = _to_chw(data.primary[j]).to(device)
+            w = _to_chw(data.wrist[j]).to(device)
+            prev = torch.as_tensor(data.prev[j], device=device)
+            pro = torch.as_tensor(data.proprio[j], device=device)
+            out[j] = model(p, w, prev, pro).cpu().numpy()
+    return out
+
+
 @torch.no_grad()
 def raw_r3m_feats(data, device, bs=512, backbone="resnet18"):
     """Concatenated raw (frozen) R3M features for both views -> (N, 2*feat_dim). The no-training baseline."""

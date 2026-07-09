@@ -3,5 +3,9 @@
 __pycache__
 logs/
 research/data/
-research/results/
+research/**/results/
+/rollouts/
 /robocasa-cosmos-policy/
+research/skip_v2/official_data/
+research/**/caches/
+research/**/cache/

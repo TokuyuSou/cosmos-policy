@@ -104,6 +104,25 @@ cd research && ../.venv/bin/python action_predictor/cache_hit_viz.py \
 → a live-vs-matched-cache filmstrip, the retrieval-source timeline, and hit-frame progress. The skip
 trace already records each hit's cache provenance (`hit_src_ep`/`hit_src_imgidx`/`hit_dist`) for every run.
 
+## LIBERO (another simulator backend)
+All simulator-specific glue lives in **one module, `action_predictor/sim.py`**, selected by `--sim`
+(default `robocasa`, so the above is unchanged). Collection and closed-loop take `--sim`; the encoder /
+retrieval / plotting / cache-hit code is simulator-agnostic. To run a LIBERO task:
+
+- **Environment**: use the `libero` uv group, and do the one-time LIBERO setup (its first import asks for a
+  dataset path — answer once, or create `~/.libero/config.yaml`). The LIBERO Cosmos checkpoint
+  (`nvidia/Cosmos-Policy-LIBERO-Predict2-2B`) downloads automatically.
+- A LIBERO "task" is **`<suite>:<task_id>`** (suites: `libero_spatial/object/goal/10/90`; `task_id` 0–9).
+  Each task has 50 init-states; the pipeline **splits** them — init `0–39` → collection/cache/encoder,
+  init `40–49` → held-out closed-loop eval (eval unseen by the cache, as in RoboCasa).
+- **One task end-to-end**: `bash research/scripts/run_libero_task_pipeline.sh libero_spatial 0`
+  (collect → gripper auto → encoder ∥ full-VLA ceiling → fused closed-loop → plot, all `--sim libero`).
+
+Everything that differs from RoboCasa is inside `sim.py`: env creation (`benchmark`→`get_libero_env`+
+`set_init_state`), success = the env `done` flag, `chunk_size` 16, agentview+wrist views, 256→224 image
+resize. The fused flow never uses the VLA future-image latent, so LIBERO returns a zeroed (robocasa-shaped)
+one — the saved-npz schema is identical and the encoder/retrieval code is unchanged.
+
 ## Validated settings
 - **Encoder**: residual fusion, modality-dropout 0, R3M `layer4` fine-tune, 256-d output, branches 512,
   `corr+supcon` (k=8, temp 0.1), 120 epochs, checkpoint selected by **val RMSE@1**.

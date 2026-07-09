@@ -194,6 +194,81 @@ class DistGateSkipPolicy(SkipPolicy):
         return bool(d1 < self.tau)   # SKIP (trust retrieval) iff in-support (small d1)
 
 
+_FUSEDGATE_CACHE = {}  # one (RetrievalPolicy(fused), calib-d1) per (data_dir, encoder, state_source, cache_eps, split)
+
+
+def _build_fusedgate(data_dir, fused_encoder, state_source, cache_episodes, val_frac, seed, device,
+                     fused_renorm=False):
+    """Build the SAME fused cache + encoder the deployed fused retrieval uses (RetrievalPolicy fused mode),
+    plus the held-out (val) top-1 fused-embedding distance distribution used to calibrate the threshold.
+    Returns (RetrievalPolicy, calib_d1[Nval]). Cached across q values. ``fused_renorm`` is forwarded so the
+    gate's encoder + held-out calibration use the SAME (Option A) normalization as the deployed retrieval."""
+    import torch
+    from retrieval_policy import RetrievalPolicy
+
+    from dataset import build_samples, list_success_episodes, split_episode_files
+    from obs_embed import compute_fused_emb
+
+    rp = RetrievalPolicy(data_dir, key="prev_state", k=1, state_source=state_source,
+                         cache_episodes=(cache_episodes or None), fused_encoder=fused_encoder,
+                         fused_renorm=fused_renorm)
+    val_files = split_episode_files(list_success_episodes(data_dir), val_frac, seed)[1]
+    vs = build_samples(val_files, rp.views, [state_source], with_image=True)
+    vemb = compute_fused_emb(vs, rp.encoder, rp.device, state_source).astype(np.float32)   # (Nval, D)
+    dev = device or rp.device
+    calib = torch.cdist(torch.as_tensor(vemb, device=dev),
+                        torch.as_tensor(rp.keys, device=dev)).min(1).values.cpu().numpy()  # held-out d1
+    return rp, calib
+
+
+class FusedDistGateSkipPolicy(SkipPolicy):
+    """Out-of-support gate on the FUSED encoder's retrieval (no VLA call): SKIP -- trust the fused retrieval
+    -- only when the live state is IN-SUPPORT of the cache, i.e. the nearest cache-embedding distance d1 in
+    the fused (image + proprio + prev-actions) metric space is small. When d1 is large there is no close
+    cached match (novel/drifted state), so CALL the VLA. d1 is literally the deployed FUSED retrieval's own
+    top-1 distance (this reuses RetrievalPolicy's fused cache + encoder), so the gate adds no model. The
+    top-1 fused distance is a strong predictor of retrieval RMSE (offline spearman ~0.5-0.7, better than the
+    N1 key's distance -- see research/replan_study/GATE_RESULTS.md), which is exactly what this gate exploits.
+
+    tau = q-quantile of d1 over the held-out (val) decision points, calibrated OFFLINE so that q ~= the
+    in-support ACCEPT RATIO (skip the closest, smallest-d1 fraction q). The closed-loop EFFECTIVE skip rate
+    is then MEASURED (typically < q, since rollouts also visit off-support states the gate routes to the VLA
+    -- the point). Composes with the runner-level --max-skips consecutive-skip drift budget exactly like the
+    other gates (the budget is enforced in closed_loop.run_closed_loop_episode, gate-agnostic). The N1
+    counterpart is DistGateSkipPolicy; this is its fused-encoder analog. Same interface/convention as the
+    other gates: decide(ctx)->bool, `self.last` trace dict, `name`.
+    """
+
+    name = "fusedgate"
+
+    def __init__(self, data_dir, q, fused_encoder, state_source="actual_next_proprio",
+                 cache_episodes=0, val_frac: float = 0.15, seed: int = 0, device=None,
+                 fused_renorm=False):
+        assert fused_encoder, "fusedgate requires --fused-encoder (the multimodal fused encoder checkpoint)"
+        ck = (os.path.abspath(data_dir), os.path.abspath(fused_encoder), state_source,
+              int(cache_episodes or 0), val_frac, seed, bool(fused_renorm))
+        if ck not in _FUSEDGATE_CACHE:
+            _FUSEDGATE_CACHE[ck] = _build_fusedgate(data_dir, fused_encoder, state_source,
+                                                    cache_episodes, val_frac, seed, device,
+                                                    fused_renorm=fused_renorm)
+        self.rp, calib = _FUSEDGATE_CACHE[ck]
+        self.q, self.state_source = float(q), state_source
+        self.tau = float(np.quantile(calib, self.q))  # skip the closest (smallest-d1) fraction q
+
+    def reset(self) -> None:
+        pass
+
+    def decide(self, ctx: dict) -> bool:
+        assert ctx.get("current_image") is not None and ctx.get("current_wrist") is not None, \
+            "fusedgate needs live primary+wrist frames in ctx (current_image / current_wrist)"
+        emb = self.rp._embed_live_fused(ctx["current_image"], ctx["current_wrist"],
+                                        np.asarray(ctx["prev_actions"], np.float32),
+                                        np.asarray(ctx["current_proprio"], np.float32))  # fused embedding (D,)
+        d1 = float(np.linalg.norm(self.rp.keys - emb[None, :], axis=1).min())  # the fused retrieval's NN distance
+        self.last = {"score": d1, "tau": self.tau, "q": self.q, "fused_dist": d1}  # skip iff score < tau
+        return bool(d1 < self.tau)   # SKIP (trust fused retrieval) iff in-support (small d1)
+
+
 _DISAGREE_CACHE = {}  # one (RetrievalPolicy, calib) per (data_dir, key, knn, state_source, cache_eps, K, w, split)
 
 

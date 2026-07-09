@@ -19,6 +19,8 @@ with the ground-truth answer): here the query is built only from information ava
 
 from __future__ import annotations
 
+import json
+import os
 import warnings
 
 import numpy as np
@@ -41,10 +43,33 @@ class RetrievalPolicy:
     def __init__(self, data_dir: str, key: str = "prev_state", k: int = 1,
                  state_source: str = DEFAULT_STATE_SOURCE, img_views: str = "primary",
                  val_frac: float = 0.15, seed: int = 0, cache_episodes: int | None = None,
-                 consensus_encoder: str = "", consensus_k: int = 50, fused_encoder: str = ""):
+                 consensus_encoder: str = "", consensus_k: int = 50, fused_encoder: str = "",
+                 combine: str = "mean", combine_beta: float = 0.15, combine_tau: float = 0.0,
+                 combine_grip: str = "top1", fused_renorm: bool = False):
         assert key in KEY_CHOICES, f"key must be one of {KEY_CHOICES}"
         assert k >= 1
         self.key, self.k, self.state_source = key, int(k), state_source
+        # How the k nearest cache VALUES are combined into the executed chunk (see _knn_value):
+        #   'mean'    -- legacy: top-1 if k==1 else UNIFORM mean of the k nearest (DEFAULT, unchanged).
+        #   'softknn' -- kernel-weighted (Nadaraya-Watson) average over the k nearest, weights
+        #                w_j ∝ exp(-(d_j - d_min)/(beta*mean_k d)). Offline this beats top-1 by ~16%
+        #                z-RMSE because the metric ranks neighbours well but can't SELECT the best one,
+        #                so distance-weighted averaging cuts variance. Gripper is kept discrete and an
+        #                optional mode-guard (combine_tau>0) drops action-outlier neighbours first.
+        assert combine in ("mean", "softknn", "mode"), "combine must be 'mean', 'softknn' or 'mode'"
+        assert combine_grip in ("top1", "mean"), "combine_grip must be 'top1' or 'mean'"
+        self.combine = combine
+        self.combine_beta = float(combine_beta)
+        self.combine_tau = float(combine_tau)      # >0 enables the mode-guard (radius = tau * median pair-dist)
+        self.combine_grip = combine_grip           # 'top1' keeps the nearest neighbour's discrete gripper
+        # Optional per-skip retrieval diagnostics (env RETR_LOG=<prefix>): logs, for EVERY predict_chunk,
+        # the top-1 key distance (OOD signal), shortlist mean distance, effective #neighbours, and the
+        # executed-chunk change (softknn vs top1). One JSON line per skip -> <prefix>_<pid>.jsonl. Off by
+        # default (no env) -> zero overhead, no behaviour change. Used to compare ONLINE query geometry to
+        # the offline test distribution (does the -16% offline gain survive the closed-loop state shift?).
+        self._logpath = os.environ.get("RETR_LOG")
+        self._logf = None
+        self._nskip_logged = 0
         self.use_state = "state" in key
         self.use_img = "img" in key
         self.views = [VIEW_NAME_TO_IDX[v.strip()] for v in img_views.split(",") if v.strip()] if self.use_img else []
@@ -59,6 +84,11 @@ class RetrievalPolicy:
         # are embedded the same way and the nearest entry's value is returned. Off by default (="").
         self.fused = bool(fused_encoder)
         assert not (self.fused and self.consensus), "fused_encoder and consensus_encoder are mutually exclusive"
+        # Option A re-normalization (fused only): re-fit the encoder's prev/proprio z-score to THIS cache's
+        # own stats, overriding the checkpoint's baked training stats. Off by default -> behaviour identical
+        # (the encoder uses its saved stats). On => train/deploy normalization match, so a multi-task or
+        # unseen-task encoder sees inputs in the DEPLOY task's own frame (see obs_embed.fit_encoder_norm).
+        self.fused_renorm = bool(fused_renorm)
         if self.fused:
             assert state_source == "actual_next_proprio", (
                 "fused_encoder requires --state-source actual_next_proprio "
@@ -67,8 +97,13 @@ class RetrievalPolicy:
         # Cache = same train split as the action-predictor eval (default), OR the first
         # `cache_episodes` success episodes when set (to match a gate built on that same cache).
         need_img = self.consensus or self.fused
-        files = list_success_episodes(data_dir)
-        cache_files = files[:cache_episodes] if cache_episodes else split_episode_files(files, val_frac, seed)[0]
+        # data_dir may be a comma-separated LIST of dirs (mixed multi-task cache): pool each dir's cache
+        # files (its train split, or first cache_episodes). A single dir reproduces the original behaviour.
+        self.data_dirs = [d for d in str(data_dir).split(",") if d]
+        cache_files = []
+        for d in self.data_dirs:
+            fs = list_success_episodes(d)
+            cache_files += (fs[:cache_episodes] if cache_episodes else split_episode_files(fs, val_frac, seed)[0])
         samples = build_samples(cache_files, self.views, [state_source], with_image=need_img)
         with warnings.catch_warnings():  # benign empty-slice stats for unused (image) modality
             warnings.simplefilter("ignore", RuntimeWarning)
@@ -85,24 +120,32 @@ class RetrievalPolicy:
         self.run_dir = data_dir
 
         if self.fused:  # learned multimodal key REPLACES N1: cache embeddings + keep the encoder for live queries
-            import os
+            import hashlib
             import torch
             from obs_embed import compute_fused_emb, load_fused_encoder
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             self.encoder = load_fused_encoder(fused_encoder, self.device)
+            rn = ""
+            if self.fused_renorm:  # Option A: override baked stats with this cache's (deploy task's) stats.
+                from obs_embed import fit_encoder_norm   # applied IN PLACE -> both cache + live query use it.
+                self.encoder.set_norm(*fit_encoder_norm(samples, state_source))
+                rn = "_renorm"      # namespace the embedding cache so a renormed/non-renormed run never collide
             cdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
-            dn = os.path.basename(os.path.normpath(data_dir))
+            dn = (os.path.basename(os.path.normpath(self.data_dirs[0])) if len(self.data_dirs) == 1 else
+                  f"mix{len(self.data_dirs)}_" + hashlib.md5(",".join(self.data_dirs).encode()).hexdigest()[:8])
             et = os.path.splitext(os.path.basename(fused_encoder))[0]
             self.keys = compute_fused_emb(samples, self.encoder, self.device, state_source,
-                                          os.path.join(cdir, f"fusedemb_{dn}_{et}_retrcache.npz")).astype(np.float32)
-            self.img_mode = f"fused[{et}]:k{k}"
+                                          os.path.join(cdir, f"fusedemb_{dn}_{et}{rn}_retrcache.npz")).astype(np.float32)
+            self.img_mode = f"fused[{et}{rn}]:k{k}{self._combine_suffix()}"
+            self.n_rollout = 0
+            self.n_demo = len(self.keys)      # demo-prefix length
+            self.rollout_gate_tau = None      # off-support gate threshold (None = gate off; kept for _gated_dist)
             return
 
         self.keys = np.stack([self._key(s.prev_actions, s.states[state_source], s.future_img)
                               for s in samples]).astype(np.float32)  # (N, D)
-        self.img_mode = f"retrieval:{key}:k{k}"
+        self.img_mode = f"retrieval:{key}:k{k}{self._combine_suffix()}"
         if self.consensus:  # build the encoder cache keys (kept loaded for the live query at each skip)
-            import os
             import torch
             from obs_embed import attach_obs_emb, load_corr_encoder
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -112,6 +155,18 @@ class RetrievalPolicy:
             attach_obs_emb(samples, self.encoder, self.device, os.path.join(cdir, f"obsemb_{dn}_{et}_retrcache.npz"))
             self.emb_keys = np.stack([s.obs_emb for s in samples]).astype(np.float32)  # (N, D_emb) encoder cache keys
             self.img_mode = f"consensus[{et}:K{self.consensus_k}]+{self.img_mode}"
+
+        self.n_dagger = 0
+
+    def _combine_suffix(self) -> str:
+        """Tag for img_mode/logging. Empty for the legacy 'mean' path so existing run names are unchanged."""
+        if self.combine == "mean":
+            return ""
+        if self.combine == "mode":
+            return f":mode(b{self.combine_beta})"
+        g = "" if self.combine_grip == "top1" else "_gripmean"
+        t = "" if self.combine_tau <= 0 else f"_t{self.combine_tau}"
+        return f":softknn(b{self.combine_beta}{t}{g})"
 
     def _key(self, prev_actions, state, future_img) -> np.ndarray:
         """Flatten the selected, per-modality-normalized features into one vector."""
@@ -131,6 +186,17 @@ class RetrievalPolicy:
                else np.zeros((len(self.views), 16, 28, 28), np.float32))
         return self._key(np.asarray(prev_actions, np.float32), np.asarray(state, np.float32), img)
 
+    def _gated_dist(self, dist):
+        """OFF-SUPPORT gate for the expanded cache (fused + rollout_cache + rollout_gate_q only).
+        If the query is IN-SUPPORT of the demo cache (demo-prefix top-1 distance <= gate tau), restrict
+        retrieval to the demo prefix -- the demos already cover it, and rollout entries there can only
+        act as near-tie distractors (measured: executed rollout chunks differ from the nearest-demo
+        chunk by ~1.6x the metric's intrinsic action resolution). Off-support queries keep the FULL
+        cache (that is what the expansion is for). No-op (returns dist unchanged) when the gate is off."""
+        if self.rollout_gate_tau is not None and dist[:self.n_demo].min() <= self.rollout_gate_tau:
+            return dist[:self.n_demo]
+        return dist
+
     def _record_match(self, j, dist):
         """Record the executed cache entry j (its real-frame provenance + key distance) in self.last_match,
         so the closed-loop trace can log exactly which cached frame was hit at each skip."""
@@ -138,6 +204,106 @@ class RetrievalPolicy:
         self.last_match = {"cache_idx": j, "src_ep": self.src_ep[j], "src_imgidx": self.src_imgidx[j],
                            "src_t": self.src_t[j], "dist": float(dist[j])}
         return j
+
+    def _knn_value(self, dist) -> np.ndarray:
+        """Combine the k nearest cache values for a query whose key-distance to every cache entry is
+        ``dist`` (N,). Returns the executed chunk (16,7) physical and sets self.last_match to the
+        executed top-1 (nearest) entry's provenance. Behaviour is selected by self.combine:
+
+          'mean'    : top-1 if k==1, else the UNIFORM mean of the k nearest -- the legacy path, byte-
+                      identical to the previous code.
+          'softknn' : kernel-weighted (Nadaraya-Watson) average of the k nearest. Weights
+                      w_j ∝ exp(-(d_j - d_min)/(beta * mean_k d)) trust nearer neighbours more (the
+                      embedding ranks neighbours well); averaging cuts the single-draw variance of
+                      top-1. The discrete gripper dim is taken from the top-1 (never averaged) unless
+                      combine_grip=='mean'; combine_tau>0 first drops neighbours whose action chunk is
+                      farther than tau * (median pairwise action-dist) from the top-1 (mode-guard).
+          'mode'    : consensus-mode -- EXECUTE the single REAL top-k chunk at the trusted-density peak
+                      (no averaging). The conditional MEAN (softknn) minimises z-RMSE to one demo but
+                      blends modes and dilutes decisive actions; the conditional MODE keeps a coherent,
+                      full-commitment, on-manifold demo chunk. See _mode_value.
+        """
+        if self.k == 1:
+            j = self._record_match(dist.argmin(), dist)
+            self._log_skip(dist, np.array([j]), None, None)
+            return self.values[j].copy()
+        idx = np.argpartition(dist, self.k)[: self.k]            # k nearest (unordered)
+        near = int(np.argmin(dist[idx]))                        # local pos of the top-1 within idx
+        if self.combine == "mean":
+            self._record_match(idx[near], dist)                 # provenance = the executed top-1
+            self._log_skip(dist, idx, None, None)
+            return self.values[idx].mean(axis=0).astype(np.float32)
+        if self.combine == "mode":
+            return self._mode_value(dist, idx, near)            # consensus-mode (real chunk; see below)
+        # ---- soft-kNN fusion ----
+        self._record_match(idx[near], dist)                     # provenance = the executed top-1
+        dv = dist[idx].astype(np.float64)                       # (k,) embedding distances of the shortlist
+        V = self.values[idx]                                    # (k,16,7) physical candidate chunks
+        keep = np.ones(len(idx), dtype=bool)
+        if self.combine_tau > 0:                                # mode-guard: prune action-outlier neighbours
+            af = ((V[..., :6] - self.norm.act_mean[:6]) / self.norm.act_std[:6]).reshape(len(V), -1)
+            d0 = np.sqrt(((af - af[near][None]) ** 2).mean(1))  # action-dist of each neighbour to top-1
+            iu = np.triu_indices(len(V), k=1)
+            pair = np.sqrt(((af[:, None, :] - af[None, :, :]) ** 2).mean(2))[iu]
+            r = float(np.median(pair)) + 1e-9
+            keep = d0 <= self.combine_tau * r
+        h = self.combine_beta * dv.mean() + 1e-9
+        w = np.exp(-(dv - dv.min()) / h) * keep
+        w = (w / w.sum()).astype(np.float32)
+        out = (w[:, None, None] * V).sum(axis=0).astype(np.float32)   # (16,7)
+        if self.combine_grip == "top1":
+            out[:, 6] = V[near, :, 6]                           # keep the nearest neighbour's discrete gripper
+        self._log_skip(dist, idx, out, V[near], w=w)
+        return out
+
+    def _mode_value(self, dist, idx, near):
+        """Consensus-mode retrieval: among the k-nearest REAL cache chunks, execute the one at the
+        trusted-density peak (the conditional MODE), as a single coherent demo chunk -- no averaging,
+        so full commitment is kept (softknn's MEAN dilutes decisive actions; the MODE does not).
+
+          w_j  = exp(-(d_j - d_min)/(beta * mean_k d))      # embedding-trust weight (encoder geometry)
+          A_jl = z-scored action-chunk distance (non-grip)  # disagreement between candidates j, l
+          h    = median off-diagonal A                       # per-query bandwidth
+          rho_j= Σ_l w_l * exp(-½ (A_jl/h)²)                 # trusted-neighbour density at candidate j
+          execute V[argmax_j rho_j]                          # the REAL chunk at the consensus peak
+        """
+        dv = dist[idx].astype(np.float64)                       # (k,) shortlist embedding distances
+        V = self.values[idx]                                    # (k,16,7) real candidate chunks
+        h = self.combine_beta * dv.mean() + 1e-9
+        w = np.exp(-(dv - dv.min()) / h); w = w / w.sum()       # embedding-trust weights
+        af = (V[..., :6] / self.norm.act_std[:6]).reshape(len(V), -1)   # z-scored non-grip features (mean cancels)
+        A = np.sqrt(((af[:, None, :] - af[None, :, :]) ** 2).mean(-1))  # (k,k) z-RMSE action distance
+        iu = np.triu_indices(len(V), k=1)
+        hb = float(np.median(A[iu])) + 1e-9                     # per-query bandwidth (median pairwise)
+        dens = (w[None, :] * np.exp(-0.5 * (A / hb) ** 2)).sum(axis=1)  # (k,) trusted local density
+        m = int(dens.argmax())
+        self._record_match(idx[m], dist)                        # provenance = the EXECUTED (mode) chunk
+        self._log_skip(dist, idx, V[m].astype(np.float32), V[near], w=w)
+        return V[m].copy().astype(np.float32)
+
+    def _log_skip(self, dist, idx, sk_chunk, t1_chunk, w=None):
+        """Append one per-skip diagnostic record (only when env RETR_LOG is set). Records the geometry of
+        THIS live query so the online distribution can be compared to the offline test distribution:
+          d_top1     : key distance to the nearest cache entry (OOD signal -- larger online => state drift)
+          d_meank    : mean key distance over the k-shortlist
+          n_eff      : effective #neighbours of the softknn kernel (1/Σw²; ~1 => collapsed to top1)
+          chunk_diff : z-RMSE between the executed softknn chunk and the top1 chunk (continuous dims),
+                       early(0-3) and late(8-15) -- how much execution actually changed at this skip
+        """
+        if not getattr(self, "_logpath", None):
+            return
+        if getattr(self, "_logf", None) is None:
+            self._logf = open(f"{self._logpath}_{os.getpid()}.jsonl", "a")
+        dv = dist[idx].astype(np.float64)
+        rec = {"d_top1": float(dv.min()), "d_meank": float(dv.mean()), "k": int(len(idx)),
+               "n_eff": (float(1.0 / np.sum(w ** 2)) if w is not None else 1.0)}
+        if sk_chunk is not None and t1_chunk is not None:
+            d = ((sk_chunk - t1_chunk) / self.norm.act_std)[..., :6]
+            rec["chunk_diff_early"] = float(np.sqrt((d[:4] ** 2).mean()))
+            rec["chunk_diff_late"] = float(np.sqrt((d[8:] ** 2).mean()))
+        self._logf.write(json.dumps(rec) + "\n")
+        self._logf.flush()
+        self._nskip_logged += 1
 
     def predict_chunk(self, prev_actions, current_proprio, cached_future_proprio,
                       cached_future_img, current_image=None, current_wrist=None) -> np.ndarray:
@@ -149,21 +315,13 @@ class RetrievalPolicy:
                 "fused retrieval needs live primary+wrist frames (current_image/current_wrist)"
             q = self._embed_live_fused(current_image, current_wrist, prev_actions, current_proprio)
             dist = np.linalg.norm(self.keys - q[None, :], axis=1)  # (N,) fused-embedding distances
-            if self.k == 1:
-                return self.values[self._record_match(dist.argmin(), dist)].copy()
-            idx = np.argpartition(dist, self.k)[: self.k]
-            self._record_match(idx[np.argmin(dist[idx])], dist)  # top-1 among the averaged k (for provenance)
-            return self.values[idx].mean(axis=0).astype(np.float32)
+            return self._knn_value(self._gated_dist(dist))
         q = self._query_key(prev_actions, current_proprio, cached_future_proprio, cached_future_img)
         dist = np.linalg.norm(self.keys - q[None, :], axis=1)  # (N,) N1 distances
         if self.consensus and current_image is not None and current_wrist is not None:
             return self.values[self._record_match(
                 self._consensus_idx(dist, current_image, current_wrist), dist)].copy()  # top-1 (consensus)
-        if self.k == 1:
-            return self.values[self._record_match(dist.argmin(), dist)].copy()
-        idx = np.argpartition(dist, self.k)[: self.k]  # k nearest (unordered)
-        self._record_match(idx[np.argmin(dist[idx])], dist)
-        return self.values[idx].mean(axis=0).astype(np.float32)
+        return self._knn_value(dist)
 
     def _embed_live(self, image, wrist) -> np.ndarray:
         """Encoder embedding of the live 224x224 primary+wrist frames (same preprocessing as PredictorPolicy)."""

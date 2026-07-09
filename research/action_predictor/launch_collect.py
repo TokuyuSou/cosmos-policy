@@ -39,6 +39,8 @@ def main():
     ap.add_argument("--collector", default="collect_data_dense.py",
                     choices=["collect_data.py", "collect_data_dense.py"])
     ap.add_argument("--task", default="PnPCounterToStove")
+    ap.add_argument("--sim", default="robocasa", choices=["robocasa", "libero"],
+                    help="simulator backend forwarded to the collector (sim.py)")
     ap.add_argument("--total-episodes", type=int, default=150)
     ap.add_argument("--episode-offset", type=int, default=0,
                     help="first episode index (default 0). Use to APPEND new episodes to an existing "
@@ -81,8 +83,8 @@ def main():
                "--episode-start", str(abs_start), "--num-episodes", str(cnt),
                "--out-dir", args.out_dir, "--seed", str(args.seed),
                "--denoising-steps", str(args.denoising_steps)]
-        if is_dense:
-            cmd += ["--query-stride", str(args.query_stride)]
+        if is_dense:  # only the dense collector takes --sim / --query-stride
+            cmd += ["--sim", args.sim, "--query-stride", str(args.query_stride)]
             if args.no_vla_shadow:
                 cmd += ["--no-vla-shadow"]
         log_path = os.path.join(args.out_dir, f"log_gpu{gpu}_ep{abs_start:04d}-{abs_start + cnt - 1:04d}.log")

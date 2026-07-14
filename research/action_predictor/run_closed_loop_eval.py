@@ -34,6 +34,7 @@ from sim import get_backend
 from predictor_policy import PredictorPolicy
 from retrieval_policy import RetrievalPolicy
 from tmt_policy import TMTRetrievalPolicy
+from reference_servo_tmt_policy import ReferenceServoTMTPolicy
 from skip_policy import make_skip_policy
 
 
@@ -48,6 +49,17 @@ def build_policy(args):
         assert args.tmt_encoder, "--tmt-encoder (the trained TMT .pt) is required for --policy tmt"
         return TMTRetrievalPolicy(args.data_dir, args.tmt_encoder, state_source=args.state_source,
                                   cache_episodes=(args.cache_episodes or None), w=args.tmt_w)
+    if args.policy == "reference_servo_tmt":
+        assert args.data_dir, "--data-dir is required for --policy reference_servo_tmt"
+        assert args.tmt_encoder, "--tmt-encoder is required for --policy reference_servo_tmt"
+        assert args.servo_model, "--servo-model is required for --policy reference_servo_tmt"
+        return ReferenceServoTMTPolicy(
+            args.data_dir, args.tmt_encoder, args.servo_model,
+            state_source=args.state_source,
+            cache_episodes=(args.cache_episodes or None), w=args.tmt_w,
+            tmt_period_steps=NUM_OPEN_LOOP_STEPS,
+            local_replan_steps=args.local_replan_steps,
+        )
     assert args.run, "--run (trained predictor dir) is required for --policy predictor"
     return PredictorPolicy(args.run)
 
@@ -68,17 +80,19 @@ def build_settings(args):
 
 
 def eval_setting(cfg, cosmos, dataset_stats, predictor, policy, tag, extra, task, ep_start, n_ep, out_dir,
-                 backend=None):
+                 backend=None, local_replan_steps=0):
     video_dir = os.path.join(out_dir, "videos", tag)  # save every episode's rollout video
     succ, skips, calls, episodes, traces, hit_rows = 0, 0, 0, [], [], []
     for ep in range(ep_start, ep_start + n_ep):
         r = run_closed_loop_episode(cfg, cosmos, dataset_stats, predictor, policy, task, ep,
-                                    video_dir=video_dir, backend=backend)
+                                    video_dir=video_dir, backend=backend,
+                                    local_replan_steps=(local_replan_steps or None))
         succ += int(r["success"])
         skips += r["n_skip"]
         calls += r["n_call"]
         episodes.append({"ep": ep, "success": r["success"], "length": r["length"],
-                         "n_call": r["n_call"], "n_skip": r["n_skip"]})
+                         "n_call": r["n_call"], "n_skip": r["n_skip"],
+                         "n_local_replan": r.get("n_local_replan", 0)})
         print(f"  [{tag}] ep{ep} success={r['success']} len={r['length']} "
               f"calls={r['n_call']} skips={r['n_skip']}", flush=True)
         for d in r.get("trace", []):
@@ -86,9 +100,11 @@ def eval_setting(cfg, cosmos, dataset_stats, predictor, policy, tag, extra, task
         for h in r.get("hit_images", []):
             hit_rows.append({"ep": ep, **h})
     n_dec = skips + calls
+    effective_local_steps = int(local_replan_steps or NUM_OPEN_LOOP_STEPS)
     result = {"setting": tag, **extra, "success_rate": succ / max(1, n_ep),
               "n_success": succ, "n_episodes": n_ep, "total_skips": skips, "total_calls": calls,
-              "effective_skip_rate": skips / max(1, n_dec), "episodes": episodes}
+              "effective_skip_rate": skips / max(1, n_dec),
+              "local_replan_steps": effective_local_steps, "episodes": episodes}
     # Save full settings + results for THIS eval next to its videos (range-specific = parallel-safe).
     os.makedirs(video_dir, exist_ok=True)
     # per-decision skip log (where + skip/call + gate score/threshold), one JSON per line
@@ -105,6 +121,7 @@ def eval_setting(cfg, cosmos, dataset_stats, predictor, policy, tag, extra, task
             cache_idx=_g("cache_idx"), dist=np.array([h["dist"] for h in hit_rows], dtype=np.float32))
     record = {"settings": {"run": predictor.run_dir, "img_mode": predictor.img_mode,
                            "state_source": predictor.state_source, "task": task, "setting": tag, **extra,
+                           "local_replan_steps": effective_local_steps,
                            "episode_start": ep_start, "num_episodes": n_ep, "seed": cfg.seed,
                            "num_denoising_steps_action": cfg.num_denoising_steps_action},
               "results": result}
@@ -115,10 +132,12 @@ def eval_setting(cfg, cosmos, dataset_stats, predictor, policy, tag, extra, task
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--policy", default="predictor", choices=["predictor", "retrieval", "tmt"],
+    ap.add_argument("--policy", default="predictor",
+                    choices=["predictor", "retrieval", "tmt", "reference_servo_tmt"],
                     help="predictor = trained net (--run); retrieval = dictionary lookup (--data-dir; N1 key, "
                          "or fused-encoder key with --fused-encoder); tmt = transition-metric-transformer "
-                         "retrieval key (--data-dir + --tmt-encoder)")
+                         "retrieval key (--data-dir + --tmt-encoder); reference_servo_tmt = persistent "
+                         "TMT@16 + Ridge@4 (--servo-model)")
     ap.add_argument("--run", help="trained predictor run dir (required for --policy predictor)")
     ap.add_argument("--data-dir", help="cached episodes for the retrieval dictionary (retrieval / tmt)")
     ap.add_argument("--key", default="prev_state", help="retrieval lookup key: prev|prev_state|prev_state_img")
@@ -132,6 +151,10 @@ def main():
                          "the runner threads the previous decision's frames into the query")
     ap.add_argument("--tmt-w", type=float, default=-1.0,
                     help="--policy tmt: override the learned block weight w (val-calibrated, e.g. 0.5); <=0 = learned")
+    ap.add_argument("--servo-model", default="",
+                    help="frozen Reference-Servo Ridge4 .npz (--policy reference_servo_tmt)")
+    ap.add_argument("--local-replan-steps", type=int, default=0,
+                    help="within a skipped 16-step block, re-query every N steps (0 = once per block)")
     ap.add_argument("--state-source", default="actual_next_proprio",
                     help="retrieval: state feature source. actual_next_proprio = the real, locally-sensed "
                          "self-state at a skip (deployable; matches all recent baselines).")
@@ -154,6 +177,11 @@ def main():
     ap.add_argument("--denoising-steps", type=int, default=5)
     args = ap.parse_args()
 
+    if args.policy == "reference_servo_tmt":
+        assert args.local_replan_steps == 4, (
+            "--policy reference_servo_tmt requires --local-replan-steps 4"
+        )
+
     os.makedirs(args.out, exist_ok=True)
     backend = get_backend(args.sim)
     cfg = backend.build_cfg(args.task, args.seed, args.episode_start + args.num_episodes, args.denoising_steps)
@@ -169,10 +197,12 @@ def main():
     settings = build_settings(args)
     print(f"skip_policy={args.skip_policy} | settings={[t for _, t, _ in settings]}", flush=True)
     results = [eval_setting(cfg, cosmos, dataset_stats, predictor, pol, tag, extra, args.task,
-                            args.episode_start, args.num_episodes, args.out, backend=backend)
+                            args.episode_start, args.num_episodes, args.out, backend=backend,
+                            local_replan_steps=args.local_replan_steps)
                for pol, tag, extra in settings]
     report = {"run": predictor.run_dir, "policy": args.policy, "skip_policy": args.skip_policy,
               "task": args.task, "img_mode": predictor.img_mode, "state_source": predictor.state_source,
+              "local_replan_steps": int(args.local_replan_steps or NUM_OPEN_LOOP_STEPS),
               "episodes": [args.episode_start, args.episode_start + args.num_episodes],
               "by_skip_rate": results}  # key kept for backward-compat; holds one entry per setting
     # Range-specific filename so parallel workers (disjoint episode ranges) don't clobber.

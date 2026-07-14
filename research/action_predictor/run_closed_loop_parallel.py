@@ -72,7 +72,8 @@ def aggregate(out_dir, tags):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--policy", default="predictor", choices=["predictor", "retrieval", "tmt"])
+    ap.add_argument("--policy", default="predictor",
+                    choices=["predictor", "retrieval", "tmt", "reference_servo_tmt"])
     ap.add_argument("--run", help="trained predictor run dir (--policy predictor)")
     ap.add_argument("--data-dir", help="cached episodes for the dictionary (retrieval / tmt)")
     ap.add_argument("--key", default="prev_state", help="retrieval lookup key")
@@ -84,6 +85,10 @@ def main():
     ap.add_argument("--tmt-encoder", default="", help="trained TMT encoder .pt (--policy tmt)")
     ap.add_argument("--tmt-w", type=float, default=-1.0,
                     help="--policy tmt: override the learned block weight w (<=0 = learned)")
+    ap.add_argument("--servo-model", default="",
+                    help="frozen Reference-Servo Ridge4 .npz (--policy reference_servo_tmt)")
+    ap.add_argument("--local-replan-steps", type=int, default=0,
+                    help="within a skipped 16-step block, re-query every N steps (0 = once per block)")
     ap.add_argument("--state-source", default="actual_next_proprio",
                     help="retrieval: state source. actual_next_proprio = the real, locally-sensed self-state "
                          "at a skip (deployable; matches all recent baselines).")
@@ -104,6 +109,11 @@ def main():
     ap.add_argument("--stagger-sec", type=float, default=12.0)
     args = ap.parse_args()
 
+    if args.policy == "reference_servo_tmt":
+        assert args.local_replan_steps == 4, (
+            "--policy reference_servo_tmt requires --local-replan-steps 4"
+        )
+
     os.makedirs(args.out, exist_ok=True)
     save_run_config(args.out, args)  # persist hyperparameters + rerun.sh before launching workers
     for old in glob.glob(os.path.join(args.out, "part_ep*.json")):
@@ -123,16 +133,20 @@ def main():
         policy_args = ["--policy", args.policy]
         if args.policy == "predictor":
             policy_args += ["--run", args.run]
-        elif args.policy == "tmt":
-            assert args.tmt_encoder, "--policy tmt requires --tmt-encoder"
+        elif args.policy in ("tmt", "reference_servo_tmt"):
+            assert args.tmt_encoder, f"--policy {args.policy} requires --tmt-encoder"
             policy_args += ["--data-dir", args.data_dir, "--cache-episodes", str(args.cache_episodes),
                             "--state-source", args.state_source, "--tmt-encoder", args.tmt_encoder,
                             "--tmt-w", str(args.tmt_w)]
+            if args.policy == "reference_servo_tmt":
+                assert args.servo_model, "--policy reference_servo_tmt requires --servo-model"
+                policy_args += ["--servo-model", args.servo_model]
         else:  # retrieval
             policy_args += ["--data-dir", args.data_dir, "--cache-episodes", str(args.cache_episodes),
                             "--key", args.key, "--knn", str(args.knn), "--state-source", args.state_source]
             if args.fused_encoder:  # fused-encoder key (off by default = plain N1 retrieval)
                 policy_args += ["--fused-encoder", args.fused_encoder]
+        policy_args += ["--local-replan-steps", str(args.local_replan_steps)]
         sweep_args = ["--skip-policy", args.skip_policy, "--skip-rates", args.skip_rates]
         cmd = [sys.executable, os.path.join(HERE, "run_closed_loop_eval.py"),
                "--sim", args.sim, *policy_args, *sweep_args, "--task", args.task,
@@ -146,9 +160,11 @@ def main():
     print(f"workers exit codes: {rc}", flush=True)
 
     parts, agg = aggregate(args.out, tags)
-    report = {"run": args.run or args.data_dir, "policy": args.policy, "skip_policy": args.skip_policy,
+    run_id = args.run or args.servo_model or args.data_dir
+    report = {"run": run_id, "policy": args.policy, "skip_policy": args.skip_policy,
               "task": args.task, "img_mode": parts[0]["img_mode"] if parts else None,
               "state_source": parts[0]["state_source"] if parts else None,
+              "local_replan_steps": int(args.local_replan_steps or 16),
               "total_episodes": args.total_episodes, "by_skip_rate": agg}
     with open(os.path.join(args.out, "closed_loop_eval.json"), "w") as f:
         json.dump(report, f, indent=2)
@@ -156,9 +172,10 @@ def main():
     for r in agg:
         vdir = os.path.join(args.out, "videos", r["setting"])
         os.makedirs(vdir, exist_ok=True)
-        rec = {"settings": {"run": args.run or args.data_dir, "img_mode": report["img_mode"],
+        rec = {"settings": {"run": run_id, "img_mode": report["img_mode"],
                             "state_source": report["state_source"], "task": args.task,
                             "setting": r["setting"], "total_episodes": args.total_episodes,
+                            "local_replan_steps": int(args.local_replan_steps or 16),
                             "episode_start": args.episode_start, "skip_seed": args.skip_seed,
                             "gpus": args.gpus, "procs_per_gpu": args.procs_per_gpu},
                "results": r}

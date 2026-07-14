@@ -67,9 +67,18 @@ def run_closed_loop_episode(cfg, cosmos_model, dataset_stats, predictor, skip_po
     # on the H grid. Default (None/0/H) reproduces the legacy single-retrieval-per-block behaviour exactly.
     k_local = local_replan_steps or H
     assert 1 <= k_local <= H, f"local_replan_steps must be in [1, {H}], got {local_replan_steps}"
+    required_local = getattr(predictor, "required_local_replan_steps", None)
+    if required_local is not None and k_local != int(required_local):
+        raise ValueError(
+            f"{type(predictor).__name__} requires local_replan_steps={required_local}, got {k_local}"
+        )
     if k_local < H:
         assert not getattr(predictor, "oracle_query", False), \
             "local_replan_steps<H is unsupported for the oracle_query predictor (it runs the VLA per skip)"
+        if getattr(predictor, "needs_prev_frame", False):
+            assert H % k_local == 0, (
+                f"needs_prev_frame local replanning requires a period dividing H={H}, got {k_local}"
+            )
     backend = backend or get_backend("robocasa")
     env, lang, max_steps = backend.make_env(cfg, episode_idx, reseed_before_reset=deterministic_reset)
 
@@ -99,9 +108,9 @@ def run_closed_loop_episode(cfg, cosmos_model, dataset_stats, predictor, skip_po
     # ONLY to policies that declare ``needs_prev_frame`` (e.g. the TMT transition encoder); all existing
     # policies never see them -> no behaviour change. None at the first decision (policy falls back).
     prev_dec_img = prev_dec_wri = None
-    fbuf = {}   # step -> (primary, wrist) at every 4-step decision/requery event (needs_prev_frame only):
-                # lets MID-BLOCK local re-queries (k_local < H) receive the frame from exactly H steps back.
+    fbuf = {}   # step -> (primary, wrist) at the local cadence for needs_prev_frame policies
     for t in range(max_steps):
+        prepared_ob = None
         if video_dir is not None:
             vob = backend.prepare_obs(obs, cfg)
             rp.append(vob["primary_image"]); rs.append(vob.get("secondary_image")); rw.append(vob["wrist_image"])
@@ -113,8 +122,16 @@ def run_closed_loop_episode(cfg, cosmos_model, dataset_stats, predictor, skip_po
                          else np.ascontiguousarray(rob["primary_image"]).astype(np.uint8)),
                 wrist=(None if rob.get("wrist_image") is None
                        else np.ascontiguousarray(rob["wrist_image"]).astype(np.uint8))))
+        # A local query at t needs the real frame from t-H. Capture the cadence even while a VLA block
+        # owns the action queue; otherwise the first skipped block after a VLA call has holes in fbuf.
+        if k_local < H and getattr(predictor, "needs_prev_frame", False) and t % k_local == 0:
+            fob = prepared_ob = backend.prepare_obs(obs, cfg)
+            if fob.get("primary_image") is not None:
+                fbuf[t] = (np.asarray(fob["primary_image"]).copy(),
+                           np.asarray(fob["wrist_image"]).copy())
+                fbuf.pop(t - 2 * H, None)
         if len(queue) == 0 and local_left > 0:  # mid local-skip block: re-query LOCAL (no gate, no VLA)
-            ob = backend.prepare_obs(obs, cfg)
+            ob = prepared_ob if prepared_ob is not None else backend.prepare_obs(obs, cfg)
             cur_proprio = ob["proprio"].astype(np.float32)
             prev = np.stack(realized[-H:])
             _pf = {}
@@ -133,7 +150,7 @@ def run_closed_loop_episode(cfg, cosmos_model, dataset_stats, predictor, skip_po
             if ens is not None:
                 ens.add(t, pred)  # (16,7) local re-query chunk issued at step t
         if len(queue) == 0 and local_left == 0:  # gate decision point (fresh H-step block)
-            ob = backend.prepare_obs(obs, cfg)
+            ob = prepared_ob if prepared_ob is not None else backend.prepare_obs(obs, cfg)
             cur_proprio = ob["proprio"].astype(np.float32)
             can_skip = (cached_fp is not None) and (len(realized) >= H)
             ctx = {"decision_idx": decision_idx, "step": t, "cached_future_proprio": cached_fp,

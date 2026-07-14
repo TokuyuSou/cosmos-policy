@@ -76,6 +76,15 @@ def _to_chw(hwc_uint8):
     return torch.from_numpy(np.ascontiguousarray(hwc_uint8).astype(np.uint8)).permute(2, 0, 1).unsqueeze(0)
 
 
+def _phase_advance_map(src_ep, src_t, advance_steps):
+    """Map each cache row to the same episode's row ``advance_steps`` later."""
+    position = {(int(ep), int(t)): index for index, (ep, t) in enumerate(zip(src_ep, src_t))}
+    return np.asarray([
+        position.get((int(ep), int(t) + int(advance_steps)), -1)
+        for ep, t in zip(src_ep, src_t)
+    ], dtype=np.int64)
+
+
 def load_tmt(ckpt_path, device):
     """Build a TMTEncoder with the architecture INFERRED from the checkpoint shapes (nhead, not inferable,
     from the sibling metrics json; default 8) and load it; frozen + eval. Returns (model, g_img, g_eff, fd)."""
